@@ -3,6 +3,12 @@
 # LM Studio Beta Helper Script (lmstudio-beta-updater.sh)
 # Objective: Check for, download, and install latest LM Studio beta/stable on Arch Linux.
 # Coexists with AUR lmstudio-bin or acts as standalone.
+#
+# Channel selection via LM_STUDIO_CHANNEL env var:
+#   auto    - pick whichever version is newer (default)
+#   stable  - always use stable
+#   beta    - always use beta
+# Example: LM_STUDIO_CHANNEL=beta ./lmstudio-beta-updater.sh
 
 set -e
 
@@ -12,6 +18,10 @@ APPIMAGE_PATH="${OPT_DIR}/lm-studio.AppImage"
 VERSION_FILE="${OPT_DIR}/.version"
 BIN_LINK="/usr/bin/lm-studio"
 DESKTOP_FILE="/usr/share/applications/lmstudio.desktop"
+
+# Channel: auto (default), stable, or beta
+# Usage: LM_STUDIO_CHANNEL=beta ./lmstudio-beta-updater.sh
+CHANNEL="${LM_STUDIO_CHANNEL:-auto}"
 
 # --- Chunk 1: Environment & Version Discovery ---
 
@@ -32,7 +42,6 @@ check_dependencies() {
 }
 
 # Discover local version and installation type
-# Discover local version and installation type
 discover_local() {
     IS_AUR=false
     LOCAL_VERSION="none"
@@ -51,7 +60,7 @@ discover_local() {
             echo "Detected standalone installation: version ${LOCAL_VERSION}"
         fi
     elif [ "$IS_AUR" = true ]; then
-        # Fallback to pacman if .version missing (first run over an AUR install)
+    # Fallback to pacman if .version missing (first run over an AUR install)
         LOCAL_VERSION=$(pacman -Q lmstudio-bin | awk '{print $2}')
         echo "Detected AUR installation: pacman version ${LOCAL_VERSION}"
     elif [ -f "$APPIMAGE_PATH" ]; then
@@ -75,40 +84,63 @@ scrape_remote_info() {
     stable_version=$(echo "$stable_redirect" | sed -n 's/.*LM-Studio-\(.*\)-x64\.AppImage/\1/p')
 
     # 2. Fetch Beta via Page Scraping
-    local beta_url="https://lmstudio.ai/beta-releases"
-    local appimage_regex='https://[^"]+LM-Studio-[0-9a-zA-Z.-]+-x64\.AppImage'
+    # Beta page uses relative /download/ links; HTML entities (&amp;) break naive grep
     local beta_raw_link
-    beta_raw_link=$(curl -sL "$beta_url" | grep -oE "$appimage_regex" | head -n 1 || true)
-    local beta_version
-    beta_version=$(echo "$beta_raw_link" | sed -n 's/.*LM-Studio-\(.*\)-x64\.AppImage/\1/p')
+    beta_raw_link=$(curl -sL "https://lmstudio.ai/beta-releases" | sed 's/&amp;/\&/g' | grep -oE '/download/linux/x64/0\.[0-9.]+[^"]*' | grep 'channel=beta' | head -n 1 || true)
+    if [ -n "$beta_raw_link" ]; then
+        beta_raw_link="https://lmstudio.ai${beta_raw_link}"
+    fi
+    beta_version=$(echo "$beta_raw_link" | sed -n 's|.*/download/linux/x64/\([^/]*\)/.*|\1|p')
 
-    # 3. Determine Winner
-    if [ -n "$beta_version" ] && [ -n "$stable_version" ]; then
-        local newest
-        newest=$(printf "%s\n%s" "$stable_version" "$beta_version" | sort -V | tail -n 1)
-        if [ "$newest" == "$beta_version" ]; then
-            REMOTE_VERSION="$beta_version"
-            REMOTE_URL="$beta_raw_link"
-            echo "Beta version is newer or equal: ${REMOTE_VERSION}"
-        else
+    # 3. Determine which version to use based on CHANNEL
+    case "$CHANNEL" in
+        stable)
+            if [ -z "$stable_version" ]; then
+                echo "Error: Stable channel requested but could not find stable version." >&2
+                exit 1
+            fi
             REMOTE_VERSION="$stable_version"
             REMOTE_URL="$stable_redirect"
-            echo "Stable version is newer: ${REMOTE_VERSION}"
-        fi
-    elif [ -n "$stable_version" ]; then
-        REMOTE_VERSION="$stable_version"
-        REMOTE_URL="$stable_redirect"
-        echo "Only Stable version found: ${REMOTE_VERSION}"
-    elif [ -n "$beta_version" ]; then
-        REMOTE_VERSION="$beta_version"
-        REMOTE_URL="$beta_raw_link"
-        echo "Only Beta version found: ${REMOTE_VERSION}"
-    else
-        echo "Error: Could not determine remote versions from Stable redirect or Beta page." >&2
-        exit 1
-    fi
+            echo "Channel set to stable: version ${REMOTE_VERSION}"
+            ;;
+        beta)
+            if [ -z "$beta_version" ]; then
+                echo "Error: Beta channel requested but could not find beta version." >&2
+                exit 1
+            fi
+            REMOTE_VERSION="$beta_version"
+            REMOTE_URL="$beta_raw_link"
+            echo "Channel set to beta: version ${REMOTE_VERSION}"
+            ;;
+        auto|*)
+            # Default: pick whichever is newer
+            if [ -n "$beta_version" ] && [ -n "$stable_version" ]; then
+                local newest
+                newest=$(printf "%s\n%s" "$stable_version" "$beta_version" | sort -V | tail -n 1)
+                if [ "$newest" == "$beta_version" ]; then
+                    REMOTE_VERSION="$beta_version"
+                    REMOTE_URL="$beta_raw_link"
+                    echo "Auto: Beta version is newer or equal: ${REMOTE_VERSION}"
+                else
+                    REMOTE_VERSION="$stable_version"
+                    REMOTE_URL="$stable_redirect"
+                    echo "Auto: Stable version is newer: ${REMOTE_VERSION}"
+                fi
+            elif [ -n "$stable_version" ]; then
+                REMOTE_VERSION="$stable_version"
+                REMOTE_URL="$stable_redirect"
+                echo "Auto: Only Stable version found: ${REMOTE_VERSION}"
+            elif [ -n "$beta_version" ]; then
+                REMOTE_VERSION="$beta_version"
+                REMOTE_URL="$beta_raw_link"
+                echo "Auto: Only Beta version found: ${REMOTE_VERSION}"
+            else
+                echo "Error: Could not determine remote versions from Stable redirect or Beta page." >&2
+                exit 1
+            fi
+            ;;
+    esac
 }
-
 # --- Chunk 3: Version Comparison & Interactive Prompt ---
 
 # Compare local and remote versions
@@ -118,7 +150,6 @@ compare_versions() {
         SHOULD_UPDATE=true
         return
     fi
-
     if [ "$LOCAL_VERSION" == "unknown" ]; then
         echo "Local version unknown. Proceeding with update to remote version ${REMOTE_VERSION}."
         SHOULD_UPDATE=true
